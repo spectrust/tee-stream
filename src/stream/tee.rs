@@ -28,19 +28,21 @@ where
 impl<S> Stream for TeedStream<S>
 where
     S: Stream + Unpin,
-    S::Item: Clone,
+    S::Item: Clone + std::fmt::Debug,
 {
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut source = self.source.lock();
 
-        // We only need to attempt to wake the other side if our buffer was
-        // full: otherwise, we would not have previously returned pending for
-        // the other side, so there is no need to wake it.
         let buffer_was_full = source.buffer_full(self.side);
         if let Some(v) = source.pop(self.side) {
-            if buffer_was_full {
+            // We only need to attempt to wake the other side if our buffer was
+            // full: otherwise, we would not have previously returned pending for
+            // the other side, so there is no need to wake it. If our full-handling
+            // isn't using back-pressure, there's no need to wake the other side,
+            // because we will have never returned Pending for it.
+            if buffer_was_full && matches!(source.full_handling, FullBufferHandling::Backpressure) {
                 // If the other side has a waker, it is because this side's buffer
                 // was previously full. Now that we have consumed off of it, we
                 // have space for another item, so wake the other side so that it
@@ -50,11 +52,12 @@ where
             return Poll::Ready(Some(v));
         }
 
-        // If the other side's buffer is full, we can't keep consuming off the
-        // stream. Apply some back-pressure by returning Pending, and set up
-        // a waker so that, when the other stream next consumes a value out
-        // of its buffer, it can wake us up.
-        if source.other_buffer_full(self.side) {
+        let other_buffer_full = source.other_buffer_full(self.side);
+        if other_buffer_full && matches!(source.full_handling, FullBufferHandling::Backpressure) {
+            // If the other side's buffer is full, we can't keep consuming off the
+            // stream. Apply some back-pressure by returning Pending, and set up
+            // a waker so that, when the other stream next consumes a value out
+            // of its buffer, it can wake us up.
             source.set_waker(self.side, cx.waker());
             return Poll::Pending;
         }
@@ -68,7 +71,13 @@ where
             // is executing this teed stream. Push a clone of the value to the
             // other side's buffer, so that it will be immediatley ready for
             // consumption by that stream.
-            source.push_to_other_side(self.side, v);
+            //
+            // If the other buffer is full AND we've reached here, it means
+            // we're using the Overflow method of handling a full buffer, so we
+            // do NOT push the item to the other side.
+            if !other_buffer_full {
+                source.push_to_other_side(self.side, v);
+            }
         }
         Poll::Ready(v)
     }
@@ -86,6 +95,8 @@ where
     stream: S,
     /// The maximum size of the buffers for the left and right teed streams.
     buffer_limit: BufferLimit,
+    /// How to handle it when one buffer is full
+    full_handling: FullBufferHandling,
     /// State tracker for the left stream.
     left: Option<TeedStreamState<S::Item>>,
     /// State tracker for the right stream.
@@ -101,6 +112,7 @@ where
         Self {
             stream,
             buffer_limit: BufferLimit::Bytes(1_000_000),
+            full_handling: FullBufferHandling::Backpressure,
             left: Some(Default::default()),
             right: Some(Default::default()),
         }
@@ -121,6 +133,18 @@ where
     #[must_use]
     pub fn with_unlimited_buffer(mut self) -> Self {
         self.buffer_limit = BufferLimit::None;
+        self
+    }
+
+    #[must_use]
+    pub fn with_overflow_enabled(mut self) -> Self {
+        self.full_handling = FullBufferHandling::Overflow;
+        self
+    }
+
+    #[must_use]
+    pub fn with_backpressure_enabled(mut self) -> Self {
+        self.full_handling = FullBufferHandling::Backpressure;
         self
     }
 
@@ -274,6 +298,12 @@ enum BufferLimit {
     Bytes(usize),
     Length(usize),
     None,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FullBufferHandling {
+    Backpressure,
+    Overflow,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -488,6 +518,38 @@ mod tests {
         drop(right);
 
         assert_eq!(count, left.fold(0, async |acc, i| acc.max(i)).await);
+    }
+
+    #[tokio::test]
+    async fn buffer_full_overflow() {
+        let limit = 100;
+        let count = 10_000;
+
+        let stream = stream::iter(1..=count);
+        let (left, mut right) = stream
+            .tee_builder()
+            .with_max_buffer_len(limit)
+            .with_overflow_enabled()
+            .tee();
+
+        // Consume all items from the left stream. Since we're using overflow
+        // handling, left should never return Pending, even though right's
+        // buffer fills up. Items beyond the buffer limit are simply dropped
+        // for the right side.
+        let left_sum = left.fold(0, async |acc, i| acc + i).await;
+        assert_eq!((1..=count).sum::<usize>(), left_sum);
+
+        // The right stream should only have received the first `limit` items,
+        // since those were buffered before the buffer filled up. After that,
+        // items were dropped for the right side.
+        let mut right_count = 0;
+        let mut right_max = 0;
+        while let Some(v) = right.next().await {
+            right_count += 1;
+            right_max = right_max.max(v);
+        }
+        assert_eq!(limit, right_count);
+        assert_eq!(limit, right_max);
     }
 
     #[tokio::test]
