@@ -3,6 +3,9 @@ name = "tee-stream"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
+authors = ["Matthew Planchard <msplanchard@gmail.com>", "Jay Cunningham", "Rachel Kelmenson"]
+description = "Generic splitting of async streams"
+homepage = "https://github.com/spectrust/tee-stream"
 
 [dependencies]
 futures = "0.3.32"
@@ -10,3 +13,6 @@ parking_lot = "0.12.5"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "macros"] }
+
+[lints.clippy]
+future_not_send = "warn"
